@@ -2,3 +2,5 @@ v20
 pandas
 numpy
 streamlit
+PyYAML
+ujson
