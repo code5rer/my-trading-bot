@@ -6,9 +6,8 @@ import time
 from datetime import datetime
 
 # --- UI CONFIG ---
-st.set_page_config(page_title="Zarattini VWAP Bot", layout="wide")
-st.title("Zarattini and Aziz VWAP Bot")
-st.caption("Automated Strategy with Corrected API Endpoints")
+st.set_page_config(page_title="Zarattini VWAP Multi-Bot", layout="wide")
+st.title("Zarattini and Aziz Multi-Instrument Bot")
 
 # --- SIDEBAR: SETTINGS ---
 with st.sidebar:
@@ -18,35 +17,50 @@ with st.sidebar:
     env = st.selectbox("Environment", ["practice", "fxtrade"])
     
     st.header("Strategy Settings")
-    instrument = st.selectbox("Instrument", ["NAS100_USD", "US30_USD", "EUR_USD", "XAU_USD"])
+    # Updated to include all previously discussed instruments
+    instruments = st.multiselect(
+        "Instruments to Trade", 
+        ["NAS100_USD", "US30_USD", "EUR_USD", "XAU_USD"],
+        default=["NAS100_USD", "US30_USD", "EUR_USD", "XAU_USD"]
+    )
     risk_percentage = st.slider("Account Risk Percentage", 0.1, 5.0, 1.0)
     
-    if st.button("Reset PnL Tracker"):
+    if st.button("Reset Session History"):
         st.session_state.history = []
         st.rerun()
 
-# --- STATE MANAGEMENT ---
 if 'history' not in st.session_state:
     st.session_state.history = []
 
 # --- CORE FUNCTIONS ---
 
 def get_ctx():
-    """Corrected OANDA Endpoints"""
-    if env == "practice":
-        host = "api-fxpractice.oanda.com"
-    else:
-        host = "api-fxtrade.oanda.com"
+    host = "api-fxpractice.oanda.com" if env == "practice" else "api-fxtrade.oanda.com"
     return v20.Context(host, 443, token=api_key)
 
-def get_account_balance(ctx):
+def get_account_data(ctx):
+    """Fetches balance and current open positions."""
     try:
-        response = ctx.account.summary(acc_id)
-        # Handle v20 response object correctly
+        response = ctx.account.get(acc_id)
         account = response.get("account", 200)
-        return float(account.balance)
+        balance = float(account.balance)
+        positions = account.positions
+        
+        active_trades = []
+        for p in positions:
+            # Check if there is an actual long or short position
+            long_units = int(p.long.units)
+            short_units = int(p.short.units)
+            if long_units != 0 or short_units != 0:
+                active_trades.append({
+                    "Instrument": p.instrument,
+                    "Long Units": long_units,
+                    "Short Units": short_units,
+                    "Unrealized PL": float(p.unrealizedPL)
+                })
+        return balance, pd.DataFrame(active_trades)
     except Exception:
-        return 0.0
+        return 0.0, pd.DataFrame()
 
 def calculate_vwap(df):
     df['tp'] = (df['high'] + df['low'] + df['close']) / 3
@@ -58,79 +72,64 @@ def calculate_vwap(df):
     df['vwap'] = df['cum_pv'] / df['cum_v']
     return df
 
-def get_position_size(balance, current_price):
-    if balance <= 0 or current_price <= 0: return 1
-    units = (balance * (risk_percentage / 100)) / current_price
-    return int(max(1, units))
-
-def execute_trade(ctx, units):
+def execute_trade(ctx, inst, units):
     try:
-        order_data = {
-            "type": "MARKET",
-            "instrument": instrument,
-            "units": str(units),
-            "timeInForce": "FOK"
-        }
+        order_data = {"type": "MARKET", "instrument": inst, "units": str(units), "timeInForce": "FOK"}
         ctx.order.create(acc_id, order=order_data)
         st.session_state.history.append({
+            'instrument': inst,
             'side': 'Long' if int(units) > 0 else 'Short',
-            'pnl': np.random.uniform(-1, 2), # Placeholder for dashboard
             'time': datetime.now().strftime("%H:%M:%S")
         })
     except Exception as e:
-        st.error(f"Execution Error: {e}")
+        st.error(f"Trade Error for {inst}: {e}")
 
 # --- MAIN ENGINE ---
 if api_key and acc_id:
     try:
         ctx = get_ctx()
+        balance, positions_df = get_account_data(ctx)
         
-        # 1. Fetch Data
-        res = ctx.instrument.candles(instrument, granularity="M5", count=100)
-        candles = res.get("candles", 200)
+        # Display Account Status
+        col_a, col_b = st.columns(2)
+        col_a.metric("Account Balance", f"${balance:,.2f}")
         
-        if not candles:
-            st.warning("No candle data received. Checking connection...")
-            time.sleep(10)
-            st.rerun()
+        st.subheader("Current Open Positions")
+        if not positions_df.empty:
+            st.table(positions_df)
+        else:
+            st.write("No active trades currently open.")
 
-        df = pd.DataFrame([{
-            'time': c.time, 'close': float(c.mid.c), 
-            'high': float(c.mid.h), 'low': float(c.mid.l), 
-            'volume': int(c.volume)
-        } for c in candles if c.complete])
-
-        # 2. Strategy Logic
-        df = calculate_vwap(df)
-        curr, prev = df.iloc[-1], df.iloc[-2]
+        st.divider()
         
-        # 3. UI Dashboard
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            st.subheader(f"Price vs VWAP: {instrument}")
-            st.line_chart(df.set_index('time')[['close', 'vwap']])
+        # Multi-Instrument Scanner
+        for inst in instruments:
+            res = ctx.instrument.candles(inst, granularity="M5", count=50)
+            candles = res.get("candles", 200)
             
-        with col2:
-            st.subheader("PnL Decomposition")
-            if st.session_state.history:
-                h_df = pd.DataFrame(st.session_state.history)
-                st.metric("Net PnL", f"${h_df['pnl'].sum():.2f}")
-                st.dataframe(h_df.groupby('side')['pnl'].sum())
-            else:
-                st.info("Scanning...")
+            if candles:
+                df = pd.DataFrame([{
+                    'time': c.time, 'close': float(c.mid.c), 
+                    'high': float(c.mid.h), 'low': float(c.mid.l), 
+                    'volume': int(c.volume)
+                } for c in candles if c.complete])
+                
+                df = calculate_vwap(df)
+                curr, prev = df.iloc[-1], df.iloc[-2]
+                
+                # Sizing logic
+                qty = int((balance * (risk_percentage / 100)) / curr.close)
+                qty = max(1, qty)
 
-        # 4. Signal and Sizing
-        balance = get_account_balance(ctx)
-        qty = get_position_size(balance, curr.close)
+                # Signal Check
+                if prev.close < prev.vwap and curr.close > curr.vwap:
+                    st.write(f"Crossing UP on {inst}: Executing Long")
+                    execute_trade(ctx, inst, qty)
+                elif prev.close > prev.vwap and curr.close < curr.vwap:
+                    st.write(f"Crossing DOWN on {inst}: Executing Short")
+                    execute_trade(ctx, inst, -qty)
         
-        if prev.close < prev.vwap and curr.close > curr.vwap:
-            st.write(f"Bullish signal: Buying {qty} units")
-            execute_trade(ctx, qty)
-        elif prev.close > prev.vwap and curr.close < curr.vwap:
-            st.write(f"Bearish signal: Selling {qty} units")
-            execute_trade(ctx, -qty)
-
-        st.caption(f"Last scan: {datetime.now().strftime('%H:%M:%S')}. Balance: ${balance:,.2f}")
+        st.caption(f"Last global scan: {datetime.now().strftime('%H:%M:%S')}")
         time.sleep(60)
         st.rerun()
 
@@ -139,4 +138,4 @@ if api_key and acc_id:
         time.sleep(10)
         st.rerun()
 else:
-    st.info("Please provide API credentials in the sidebar.")
+    st.info("Enter API details in the sidebar to begin multi-instrument trading.")
