@@ -2,35 +2,34 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import v20
-from v20.operations import OrderCreateRequest
 import time
 from datetime import datetime
 
-# --- SETTINGS & UI ---
+# --- UI CONFIG ---
 st.set_page_config(page_title="Zarattini VWAP Bot", layout="wide")
-st.title("📈 Zarattini-Aziz VWAP Automated Bot")
-st.caption("A self-optimizing intraday strategy for OANDA")
+st.title("📈 Zarattini & Aziz VWAP Bot")
+st.caption("Automated Day-Trading Strategy for OANDA")
 
-# --- SIDEBAR CONFIG ---
+# --- SIDEBAR: SETTINGS ---
 with st.sidebar:
     st.header("🔑 API Credentials")
     api_key = st.text_input("OANDA API Key", type="password")
     acc_id = st.text_input("OANDA Account ID")
     env = st.selectbox("Environment", ["practice", "fxtrade"])
     
-    st.header("⚙️ Strategy Parameters")
+    st.header("⚙️ Strategy Settings")
     instrument = st.selectbox("Instrument", ["NAS100_USD", "US30_USD", "EUR_USD", "XAU_USD"])
-    trade_size = st.number_input("Base Units (e.g., 10)", value=10)
+    base_units = st.number_input("Base Quantity (Units)", value=1, min_value=1)
     
-    if st.button("Reset Session PnL"):
+    if st.button("Reset PnL Tracker"):
         st.session_state.history = []
         st.rerun()
 
-# --- INITIALIZE SESSION STATE ---
+# --- STATE MANAGEMENT ---
 if 'history' not in st.session_state:
-    st.session_state.history = [] # Tracks: {'side', 'pnl', 'time'}
+    st.session_state.history = []  # Tracks: {'side', 'pnl', 'time', 'price'}
 
-# --- CORE FUNCTIONS ---
+# --- TRADING FUNCTIONS ---
 
 def get_ctx():
     host = f"api-{env}.oanda.com"
@@ -38,124 +37,117 @@ def get_ctx():
 
 def calculate_vwap(df):
     """
-    Implements the SSRN paper formula:
-    $$VWAP = \frac{\sum (Typical Price \times Volume)}{\sum Volume}$$
+    Calculates Intraday VWAP. 
+    Resets at the start of every new day to ensure intraday accuracy.
     """
     df['tp'] = (df['high'] + df['low'] + df['close']) / 3
-    # Reset VWAP daily to align with Zarattini's intraday focus
-    df['date'] = pd.to_datetime(df['time']).dt.date
-    df['cum_pv'] = df.groupby('date')['tp'].transform(lambda x: (x * df.loc[x.index, 'volume']).cumsum())
-    df['cum_v'] = df.groupby('date')['volume'].transform(lambda x: x.cumsum())
+    df['pv'] = df['tp'] * df['volume']
+    
+    # Ensure VWAP resets daily
+    df['time'] = pd.to_datetime(df['time'])
+    df['date'] = df['time'].dt.date
+    
+    df['cum_pv'] = df.groupby('date')['pv'].transform('cumsum')
+    df['cum_v'] = df.groupby('date')['volume'].transform('cumsum')
     df['vwap'] = df['cum_pv'] / df['cum_v']
     return df
 
-def get_optimized_size(base_size):
-    """SELF-OPTIMIZATION: Adjusts trade size based on recent win rate."""
+def get_dynamic_quantity(base_qty):
+    """
+    OPTIMIZING FEATURE: 
+    Increases size when win-rate is high, decreases when low.
+    """
     if len(st.session_state.history) < 3:
-        return base_size
+        return base_qty
     
     wins = len([t for t in st.session_state.history if t['pnl'] > 0])
-    win_rate = wins / len(st.session_state.history)
+    rate = wins / len(st.session_state.history)
     
-    if win_rate > 0.6:
-        return int(base_size * 1.5) # Scale up on winning streaks
-    elif win_rate < 0.4:
-        return int(base_size * 0.5) # De-risk on losing streaks
-    return base_size
+    if rate > 0.6: return int(base_qty * 1.5)  # Aggressive
+    if rate < 0.3: return max(1, int(base_qty * 0.5)) # Conservative
+    return base_qty
 
 def execute_trade(ctx, units):
-    """Sends a market order to OANDA."""
+    """
+    Places a Market Order. 
+    Units > 0 for Long, Units < 0 for Short.
+    """
     try:
-        # units > 0 is Buy, units < 0 is Sell
-        order_conf = dict(
-            type="MARKET",
-            instrument=instrument,
-            units=str(units),
-            timeInForce="FOK"
-        )
-        request = OrderCreateRequest(order=order_conf)
-        response = ctx.order.create(acc_id, **request.body)
+        # We pass a dictionary instead of importing 'OrderCreateRequest'
+        order_data = {
+            "type": "MARKET",
+            "instrument": instrument,
+            "units": str(units),
+            "timeInForce": "FOK"
+        }
         
-        # Log basic PnL (Mock PnL for visualization)
-        # In a real bot, you'd fetch the transaction's actual PL from OANDA
-        mock_pnl = np.random.uniform(-5, 10) 
+        response = ctx.order.create(acc_id, order=order_data)
+        
+        # Log to PnL Decomposition
+        # In live mode, PL would be fetched from the account. 
+        # Here we simulate for the dashboard.
         st.session_state.history.append({
             'side': 'Long' if units > 0 else 'Short',
-            'pnl': mock_pnl,
+            'pnl': np.random.uniform(-2, 5), # Simulated PL
             'time': datetime.now().strftime("%H:%M:%S")
         })
         return response
     except Exception as e:
-        st.error(f"Trade Execution Error: {e}")
+        st.error(f"Execution Error: {e}")
 
 # --- MAIN ENGINE ---
 if api_key and acc_id:
     try:
         ctx = get_ctx()
         
-        # 1. Fetch & Process Data
-        res = ctx.candle.get(instrument, granularity="M5", count=150)
-        candles = res.get("candles", 150)
+        # 1. Fetch Candles (5-minute timeframe)
+        res = ctx.candle.get(instrument, granularity="M5", count=100)
+        candles = res.get("candles", 100)
         
-        raw_data = []
-        for c in candles:
-            if c.complete:
-                raw_data.append({
-                    'time': c.time,
-                    'close': float(c.mid.c),
-                    'high': float(c.mid.h),
-                    'low': float(c.mid.l),
-                    'volume': int(c.volume)
-                })
-        
-        df = pd.DataFrame(raw_data)
+        df = pd.DataFrame([{
+            'time': c.time, 'close': float(c.mid.c), 
+            'high': float(c.mid.h), 'low': float(c.mid.l), 
+            'volume': int(c.volume)
+        } for c in candles if c.complete])
+
+        # 2. Strategy Logic
         df = calculate_vwap(df)
+        curr, prev = df.iloc[-1], df.iloc[-2]
         
-        # 2. Visualizations
+        # 3. UI Dashboard
         col1, col2 = st.columns([2, 1])
-        
         with col1:
-            st.subheader(f"Live Chart: {instrument}")
+            st.subheader(f"Price vs VWAP ({instrument})")
             st.line_chart(df.set_index('time')[['close', 'vwap']])
             
         with col2:
             st.subheader("PnL Decomposition")
             if st.session_state.history:
                 h_df = pd.DataFrame(st.session_state.history)
-                total_pl = h_df['pnl'].sum()
-                st.metric("Net PnL", f"${total_pl:.2f}", delta=f"{len(h_df)} Trades")
-                
-                # Breakdown by side
-                breakdown = h_df.groupby('side')['pnl'].sum()
-                st.dataframe(breakdown)
+                st.metric("Total PnL", f"${h_df['pnl'].sum():.2f}")
+                st.write("Performance by Side:")
+                st.dataframe(h_df.groupby('side')['pnl'].sum())
             else:
-                st.info("Scanning for entries...")
+                st.info("Searching for breakout...")
 
-        # 3. Strategy Logic (The Cross-Over)
-        curr = df.iloc[-1]
-        prev = df.iloc[-2]
+        # 4. The Signal (Zarattini Cross)
+        qty = get_dynamic_quantity(base_units)
         
-        # Optimization check
-        dynamic_units = get_optimized_size(trade_size)
-        
-        # Entry Long: Price crosses above VWAP
         if prev.close < prev.vwap and curr.close > curr.vwap:
-            st.toast(f"Buying {dynamic_units} units!", icon="🚀")
-            execute_trade(ctx, dynamic_units)
-            
-        # Entry Short: Price crosses below VWAP
+            st.toast(f"🚀 BULLISH BREAKOUT! Buying {qty} units.")
+            execute_trade(ctx, qty)
         elif prev.close > prev.vwap and curr.close < curr.vwap:
-            st.toast(f"Selling {dynamic_units} units!", icon="📉")
-            execute_trade(ctx, -dynamic_units)
+            st.toast(f"📉 BEARISH BREAKOUT! Selling {qty} units.")
+            execute_trade(ctx, -qty)
 
-        # 4. Auto-Refresh Logic
-        st.caption(f"Last update: {datetime.now().strftime('%H:%M:%S')}. Next scan in 60s.")
+        # 5. Refresh
+        st.caption(f"Last scan: {datetime.now().strftime('%H:%M:%S')}. Re-scanning in 60s...")
         time.sleep(60)
         st.rerun()
 
     except Exception as e:
-        st.error(f"Operational Error: {e}")
+        st.error(f"Bot Error: {e}")
         time.sleep(10)
         st.rerun()
 else:
-    st.warning("Waiting for API Credentials... Enter them in the sidebar.")
+    st.info("Enter your OANDA API details in the sidebar to start the bot.")
