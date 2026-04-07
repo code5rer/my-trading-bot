@@ -1,0 +1,4 @@
+v20
+pandas
+numpy
+streamlit
