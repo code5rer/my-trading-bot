@@ -3,12 +3,13 @@ import pandas as pd
 import numpy as np
 import v20
 import time
+import threading
 from datetime import datetime
 
 # --- UI CONFIG ---
-st.set_page_config(page_title="VWAP Auto-Reversal Bot", layout="wide")
-st.title("Zarattini and Aziz Multi-Instrument Bot")
-st.caption("No SL/TP - Trading by Signal Reversals")
+st.set_page_config(page_title="24/7 VWAP Cloud Bot", layout="wide")
+st.title("Zarattini and Aziz 24/7 Cloud Bot")
+st.caption("Background Worker Active: Trading will continue even if this tab is closed.")
 
 # --- SIDEBAR: SETTINGS ---
 with st.sidebar:
@@ -24,46 +25,17 @@ with st.sidebar:
         default=["NAS100_USD", "US30_USD", "EUR_USD", "XAU_USD"]
     )
     risk_percentage = st.slider("Account Risk Percentage", 0.1, 5.0, 1.0)
-    
-    if st.button("Reset Session History"):
-        st.session_state.history = []
-        st.rerun()
 
+# --- GLOBAL DATA STORE ---
+# This keeps data alive across browser refreshes
 if 'history' not in st.session_state:
     st.session_state.history = []
 
 # --- CORE FUNCTIONS ---
 
-def get_ctx():
+def get_ctx(api_key, env):
     host = "api-fxpractice.oanda.com" if env == "practice" else "api-fxtrade.oanda.com"
     return v20.Context(host, 443, token=api_key)
-
-def get_account_data(ctx):
-    """Fetches balance and map of open positions."""
-    try:
-        response = ctx.account.get(acc_id)
-        account = response.get("account", 200)
-        balance = float(account.balance)
-        positions = account.positions
-        
-        pos_map = {} # { 'INSTRUMENT': current_units }
-        display_data = []
-        
-        for p in positions:
-            l_units = int(p.long.units)
-            s_units = int(p.short.units)
-            net_units = l_units - s_units
-            
-            if net_units != 0:
-                pos_map[p.instrument] = net_units
-                display_data.append({
-                    "Instrument": p.instrument,
-                    "Net Units": net_units,
-                    "Unrealized PL": float(p.unrealizedPL)
-                })
-        return balance, pd.DataFrame(display_data), pos_map
-    except Exception:
-        return 0.0, pd.DataFrame(), {}
 
 def calculate_vwap(df):
     df['tp'] = (df['high'] + df['low'] + df['close']) / 3
@@ -75,93 +47,95 @@ def calculate_vwap(df):
     df['vwap'] = df['cum_pv'] / df['cum_v']
     return df
 
-def execute_reversal(ctx, inst, units_to_open, current_net_units):
-    """Closes existing position and opens the new signal direction."""
-    try:
-        # 1. Close current position by sending opposite units
-        if current_net_units != 0:
-            close_order = {
-                "type": "MARKET",
-                "instrument": inst,
-                "units": str(-current_net_units),
-                "timeInForce": "FOK"
-            }
-            ctx.order.create(acc_id, order=close_order)
-            st.write(f"Closing existing position for {inst}")
-
-        # 2. Open new position
-        open_order = {
-            "type": "MARKET",
-            "instrument": inst,
-            "units": str(units_to_open),
-            "timeInForce": "FOK"
-        }
-        ctx.order.create(acc_id, order=open_order)
-        
-        st.session_state.history.append({
-            'instrument': inst,
-            'side': 'Long' if units_to_open > 0 else 'Short',
-            'time': datetime.now().strftime("%H:%M:%S")
-        })
-    except Exception as e:
-        st.error(f"Reversal Error for {inst}: {e}")
-
-# --- MAIN ENGINE ---
-if api_key and acc_id:
-    try:
-        ctx = get_ctx()
-        balance, pos_df, pos_map = get_account_data(ctx)
-        
-        col_a, col_b = st.columns(2)
-        col_a.metric("Account Balance", f"${balance:,.2f}")
-        
-        st.subheader("Live Portfolio Status")
-        if not pos_df.empty:
-            st.table(pos_df)
-        else:
-            st.write("Neutral - No open trades.")
-
-        st.divider()
-        
-        for inst in instruments:
-            res = ctx.instrument.candles(inst, granularity="M5", count=50)
-            candles = res.get("candles", 200)
+def trading_job(api_key, acc_id, env, instruments, risk_percentage):
+    """The background task that runs 24/7 on the server."""
+    ctx = get_ctx(api_key, env)
+    
+    while True:
+        try:
+            # 1. Get Account Summary
+            response = ctx.account.get(acc_id)
+            account = response.get("account", 200)
+            balance = float(account.balance)
             
-            if candles:
-                df = pd.DataFrame([{
-                    'time': c.time, 'close': float(c.mid.c), 
-                    'high': float(c.mid.h), 'low': float(c.mid.l), 
-                    'volume': int(c.volume)
-                } for c in candles if c.complete])
-                
-                df = calculate_vwap(df)
-                curr, prev = df.iloc[-1], df.iloc[-2]
-                
-                # Position Sizing
-                qty = int((balance * (risk_percentage / 100)) / curr.close)
-                qty = max(1, qty)
-                
-                current_units = pos_map.get(inst, 0)
+            pos_map = {}
+            for p in account.positions:
+                net = int(p.long.units) - int(p.short.units)
+                if net != 0: pos_map[p.instrument] = net
 
-                # SIGNAL: CROSS UP (Buy)
-                if prev.close < prev.vwap and curr.close > curr.vwap:
-                    if current_units <= 0: # Only act if not already Long
-                        st.write(f"Bullish Cross on {inst}")
-                        execute_reversal(ctx, inst, qty, current_units)
+            # 2. Scan Instruments
+            for inst in instruments:
+                res = ctx.instrument.candles(inst, granularity="M5", count=50)
+                candles = res.get("candles", 200)
                 
-                # SIGNAL: CROSS DOWN (Sell)
-                elif prev.close > prev.vwap and curr.close < curr.vwap:
-                    if current_units >= 0: # Only act if not already Short
-                        st.write(f"Bearish Cross on {inst}")
-                        execute_reversal(ctx, inst, -qty, current_units)
-        
-        st.caption(f"Last scan: {datetime.now().strftime('%H:%M:%S')}")
-        time.sleep(60)
-        st.rerun()
+                if candles:
+                    df = pd.DataFrame([{
+                        'time': c.time, 'close': float(c.mid.c), 
+                        'high': float(c.mid.h), 'low': float(c.mid.l), 
+                        'volume': int(c.volume)
+                    } for c in candles if c.complete])
+                    
+                    df = calculate_vwap(df)
+                    curr, prev = df.iloc[-1], df.iloc[-2]
+                    
+                    qty = int((balance * (risk_percentage / 100)) / curr.close)
+                    qty = max(1, qty)
+                    current_units = pos_map.get(inst, 0)
 
-    except Exception as e:
-        st.error(f"Operational Error: {e}")
-        time.sleep(10)
-        st.rerun()
+                    # Signal Logic
+                    if prev.close < prev.vwap and curr.close > curr.vwap and current_units <= 0:
+                        if current_units != 0:
+                            ctx.order.create(acc_id, order={"type":"MARKET","instrument":inst,"units":str(-current_units),"timeInForce":"FOK"})
+                        ctx.order.create(acc_id, order={"type":"MARKET","instrument":inst,"units":str(qty),"timeInForce":"FOK"})
+                        
+                    elif prev.close > prev.vwap and curr.close < curr.vwap and current_units >= 0:
+                        if current_units != 0:
+                            ctx.order.create(acc_id, order={"type":"MARKET","instrument":inst,"units":str(-current_units),"timeInForce":"FOK"})
+                        ctx.order.create(acc_id, order={"type":"MARKET","instrument":inst,"units":str(-qty),"timeInForce":"FOK"})
+
+            time.sleep(60) # Wait 1 minute before next global scan
+        except Exception as e:
+            print(f"Background Error: {e}")
+            time.sleep(30)
+
+# --- BACKGROUND THREAD MANAGER ---
+@st.cache_resource
+def start_worker(api_key, acc_id, env, instruments, risk_percentage):
+    """Starts the background thread only once."""
+    thread = threading.Thread(
+        target=trading_job, 
+        args=(api_key, acc_id, env, instruments, risk_percentage), 
+        daemon=True
+    )
+    thread.start()
+    return "Worker Started"
+
+# --- MAIN DASHBOARD ---
+if api_key and acc_id:
+    status = start_worker(api_key, acc_id, env, instruments, risk_percentage)
+    st.success(f"Status: {status}. The bot is running on the server.")
+    
+    # Simple display for the user
+    ctx = get_ctx(api_key, env)
+    resp = ctx.account.get(acc_id)
+    acc = resp.get("account", 200)
+    
+    st.metric("Cloud-Synced Balance", f"${float(acc.balance):,.2f}")
+    
+    st.write("Current Positions (Live from OANDA):")
+    active = []
+    for p in acc.positions:
+        net = int(p.long.units) - int(p.short.units)
+        if net != 0:
+            active.append({"Instrument": p.instrument, "Net Units": net, "PL": p.unrealizedPL})
+    
+    if active:
+        st.table(pd.DataFrame(active))
+    else:
+        st.info("No active trades. The background worker is monitoring the charts.")
+    
+    # Refresh the UI every 30s so you can watch, but the bot trades independently
+    time.sleep(30)
+    st.rerun()
 else:
-    st.info("Enter API details in the sidebar to begin.")
+    st.warning("Enter API keys to launch the background worker.")
