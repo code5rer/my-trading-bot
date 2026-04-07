@@ -6,8 +6,9 @@ import time
 from datetime import datetime
 
 # --- UI CONFIG ---
-st.set_page_config(page_title="Zarattini VWAP Multi-Bot", layout="wide")
+st.set_page_config(page_title="VWAP Auto-Reversal Bot", layout="wide")
 st.title("Zarattini and Aziz Multi-Instrument Bot")
+st.caption("No SL/TP - Trading by Signal Reversals")
 
 # --- SIDEBAR: SETTINGS ---
 with st.sidebar:
@@ -17,7 +18,6 @@ with st.sidebar:
     env = st.selectbox("Environment", ["practice", "fxtrade"])
     
     st.header("Strategy Settings")
-    # Updated to include all previously discussed instruments
     instruments = st.multiselect(
         "Instruments to Trade", 
         ["NAS100_USD", "US30_USD", "EUR_USD", "XAU_USD"],
@@ -39,28 +39,31 @@ def get_ctx():
     return v20.Context(host, 443, token=api_key)
 
 def get_account_data(ctx):
-    """Fetches balance and current open positions."""
+    """Fetches balance and map of open positions."""
     try:
         response = ctx.account.get(acc_id)
         account = response.get("account", 200)
         balance = float(account.balance)
         positions = account.positions
         
-        active_trades = []
+        pos_map = {} # { 'INSTRUMENT': current_units }
+        display_data = []
+        
         for p in positions:
-            # Check if there is an actual long or short position
-            long_units = int(p.long.units)
-            short_units = int(p.short.units)
-            if long_units != 0 or short_units != 0:
-                active_trades.append({
+            l_units = int(p.long.units)
+            s_units = int(p.short.units)
+            net_units = l_units - s_units
+            
+            if net_units != 0:
+                pos_map[p.instrument] = net_units
+                display_data.append({
                     "Instrument": p.instrument,
-                    "Long Units": long_units,
-                    "Short Units": short_units,
+                    "Net Units": net_units,
                     "Unrealized PL": float(p.unrealizedPL)
                 })
-        return balance, pd.DataFrame(active_trades)
+        return balance, pd.DataFrame(display_data), pos_map
     except Exception:
-        return 0.0, pd.DataFrame()
+        return 0.0, pd.DataFrame(), {}
 
 def calculate_vwap(df):
     df['tp'] = (df['high'] + df['low'] + df['close']) / 3
@@ -72,37 +75,54 @@ def calculate_vwap(df):
     df['vwap'] = df['cum_pv'] / df['cum_v']
     return df
 
-def execute_trade(ctx, inst, units):
+def execute_reversal(ctx, inst, units_to_open, current_net_units):
+    """Closes existing position and opens the new signal direction."""
     try:
-        order_data = {"type": "MARKET", "instrument": inst, "units": str(units), "timeInForce": "FOK"}
-        ctx.order.create(acc_id, order=order_data)
+        # 1. Close current position by sending opposite units
+        if current_net_units != 0:
+            close_order = {
+                "type": "MARKET",
+                "instrument": inst,
+                "units": str(-current_net_units),
+                "timeInForce": "FOK"
+            }
+            ctx.order.create(acc_id, order=close_order)
+            st.write(f"Closing existing position for {inst}")
+
+        # 2. Open new position
+        open_order = {
+            "type": "MARKET",
+            "instrument": inst,
+            "units": str(units_to_open),
+            "timeInForce": "FOK"
+        }
+        ctx.order.create(acc_id, order=open_order)
+        
         st.session_state.history.append({
             'instrument': inst,
-            'side': 'Long' if int(units) > 0 else 'Short',
+            'side': 'Long' if units_to_open > 0 else 'Short',
             'time': datetime.now().strftime("%H:%M:%S")
         })
     except Exception as e:
-        st.error(f"Trade Error for {inst}: {e}")
+        st.error(f"Reversal Error for {inst}: {e}")
 
 # --- MAIN ENGINE ---
 if api_key and acc_id:
     try:
         ctx = get_ctx()
-        balance, positions_df = get_account_data(ctx)
+        balance, pos_df, pos_map = get_account_data(ctx)
         
-        # Display Account Status
         col_a, col_b = st.columns(2)
         col_a.metric("Account Balance", f"${balance:,.2f}")
         
-        st.subheader("Current Open Positions")
-        if not positions_df.empty:
-            st.table(positions_df)
+        st.subheader("Live Portfolio Status")
+        if not pos_df.empty:
+            st.table(pos_df)
         else:
-            st.write("No active trades currently open.")
+            st.write("Neutral - No open trades.")
 
         st.divider()
         
-        # Multi-Instrument Scanner
         for inst in instruments:
             res = ctx.instrument.candles(inst, granularity="M5", count=50)
             candles = res.get("candles", 200)
@@ -117,19 +137,25 @@ if api_key and acc_id:
                 df = calculate_vwap(df)
                 curr, prev = df.iloc[-1], df.iloc[-2]
                 
-                # Sizing logic
+                # Position Sizing
                 qty = int((balance * (risk_percentage / 100)) / curr.close)
                 qty = max(1, qty)
+                
+                current_units = pos_map.get(inst, 0)
 
-                # Signal Check
+                # SIGNAL: CROSS UP (Buy)
                 if prev.close < prev.vwap and curr.close > curr.vwap:
-                    st.write(f"Crossing UP on {inst}: Executing Long")
-                    execute_trade(ctx, inst, qty)
+                    if current_units <= 0: # Only act if not already Long
+                        st.write(f"Bullish Cross on {inst}")
+                        execute_reversal(ctx, inst, qty, current_units)
+                
+                # SIGNAL: CROSS DOWN (Sell)
                 elif prev.close > prev.vwap and curr.close < curr.vwap:
-                    st.write(f"Crossing DOWN on {inst}: Executing Short")
-                    execute_trade(ctx, inst, -qty)
+                    if current_units >= 0: # Only act if not already Short
+                        st.write(f"Bearish Cross on {inst}")
+                        execute_reversal(ctx, inst, -qty, current_units)
         
-        st.caption(f"Last global scan: {datetime.now().strftime('%H:%M:%S')}")
+        st.caption(f"Last scan: {datetime.now().strftime('%H:%M:%S')}")
         time.sleep(60)
         st.rerun()
 
@@ -138,4 +164,4 @@ if api_key and acc_id:
         time.sleep(10)
         st.rerun()
 else:
-    st.info("Enter API details in the sidebar to begin multi-instrument trading.")
+    st.info("Enter API details in the sidebar to begin.")
