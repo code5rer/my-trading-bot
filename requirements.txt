@@ -1,7 +1,6 @@
 oandapyV20
-streamlit
-pandas
-numpy
-scikit-learn
 hmmlearn
+scikit-learn
+numpy
+pandas
 ta
