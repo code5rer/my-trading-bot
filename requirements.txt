@@ -1,6 +1,7 @@
 v20
+streamlit
 pandas
 numpy
-streamlit
-PyYAML
-ujson
+scikit-learn
+hmmlearn
+ta
